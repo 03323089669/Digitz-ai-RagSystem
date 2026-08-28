@@ -47,9 +47,14 @@ export default function DataVault({ selectedBrand, onRefreshSummary, brands = []
   const selectedBrandSummary = summary.brands.find((item) => item.key === vaultBrand) ?? { docs: 0, files: 0, queries: 0, content: 0 }
   
   // Search and filter logic
+  // NOTE: file.name is guarded with `|| ''` because when the backend returns
+  // an incomplete/unauthenticated response (e.g. a failed login upstream),
+  // some file entries can come back with name undefined/null, which used to
+  // crash the whole component with "Cannot read properties of undefined
+  // (reading 'toLowerCase')".
   const filteredFiles = uploadedFiles.filter((file) => {
     const matchesBrand = file.brand_key === vaultBrand
-    const matchesSearch = file.name.toLowerCase().includes(searchTerm.toLowerCase())
+    const matchesSearch = (file.name || '').toLowerCase().includes(searchTerm.toLowerCase())
     return matchesBrand && matchesSearch
   })
 
@@ -404,7 +409,7 @@ export default function DataVault({ selectedBrand, onRefreshSummary, brands = []
               </div>
               <button className="topbar-btn" onClick={() => setPreviewFile(null)}>Close Preview</button>
             </div>
-            <div style={{ flex: 1, overflowY: 'auto', background: '#111115', border: '1px solid rgba(255,255,255,0.07)', borderRadius: '8px', padding: '20px', whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13 }}>
+            <div style={{ flex: 1, overflowY: 'auto', background: '#111115', color: '#e4e4e7',border: '1px solid rgba(255,255,255,0.07)', borderRadius: '8px', padding: '20px', whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13 }}>
               {previewLoading ? (
                 <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>Loading preview content...</div>
               ) : (

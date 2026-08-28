@@ -26,54 +26,52 @@ def ask_groq(prompt: str) -> str:
             'Groq API key is not configured. Install your key in backend/.env as GROQ_API_KEY and restart the server.'
         )
 
-    payload = {
-        'model': settings.groq_model,
-        'input': prompt,
-    }
-    headers = {
-        'Authorization': f'Bearer {settings.groq_api_key}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-    }
+    fallback_models = []
+    for m in [settings.groq_model, 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant']:
+        if m and m not in fallback_models:
+            fallback_models.append(m)
 
-    url = settings.groq_api_url.rstrip('/') + '/responses'
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    last_error = None
+    response = None
 
-    if response.status_code != 200:
-        body = response.text
-        return f'Groq API request failed ({response.status_code}): {body}'
+    for model_name in fallback_models:
+        payload = {
+            'model': model_name,
+            'messages': [
+                {'role': 'user', 'content': prompt}
+            ],
+            'temperature': 0.3,
+        }
+        headers = {
+            'Authorization': f'Bearer {settings.groq_api_key}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+
+        url = settings.groq_api_url.rstrip('/') + '/chat/completions'
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                break
+
+            last_error = f'Groq API request failed ({response.status_code}): {response.text[:200]}'
+            if response.status_code in (400, 404) and any(kw in response.text.lower() for kw in ['model', 'does not exist', 'decommissioned', 'not exist']):
+                continue
+            return "Sorry, I couldn't generate a response right now. Please try again."
+        except Exception as e:
+            last_error = f'Groq API connection error: {e}'
+            continue
+
+    if not response or response.status_code != 200:
+        return "Sorry, I couldn't generate a response right now. Please try again."
 
     data = response.json()
+    try:
+        content = data['choices'][0]['message']['content']
+        if content:
+            return content.strip()
+    except (KeyError, IndexError):
+        pass
 
-    def extract_text(item):
-        if item is None:
-            return ''
-        if isinstance(item, str):
-            return item
-        if isinstance(item, dict):
-            item_type = item.get('type')
-            if item_type == 'reasoning_text':
-                return ''
-            if item_type == 'message' and item.get('role') == 'assistant':
-                return extract_text(item.get('content'))
-            if item_type == 'output_text' and isinstance(item.get('text'), str):
-                return item['text']
-            if 'output_text' in item and isinstance(item['output_text'], str):
-                return item['output_text']
-            if 'content' in item:
-                return extract_text(item['content'])
-            if 'output' in item:
-                return extract_text(item['output'])
-            if 'text' in item and isinstance(item['text'], str):
-                return item['text']
-        if isinstance(item, list):
-            pieces = [extract_text(child) for child in item]
-            return ' '.join([piece for piece in pieces if piece])
-        return ''
+    return "Sorry, I couldn't generate a response right now. Please try again."
 
-    answer = ''
-    if isinstance(data, dict):
-        answer = extract_text(data.get('content')) or extract_text(data.get('output'))
-    if not answer:
-        answer = extract_text(data)
-    return answer.strip() or json.dumps(data, indent=2)

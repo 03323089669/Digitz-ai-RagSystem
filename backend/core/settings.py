@@ -12,7 +12,8 @@ class Settings(BaseSettings):
         alias='GROQ_API_URL',
     )
     groq_api_key: str | None = Field(default=None, alias='GROQ_API_KEY')
-    groq_model: str = Field(default='llama-3.3-70b-versatile', alias='GROQ_MODEL')
+    groq_model: str = Field(default='openai/gpt-oss-20b', alias='GROQ_MODEL')
+    groq_fallback_model: str = Field(default='openai/gpt-oss-120b', alias='GROQ_FALLBACK_MODEL')
 
     # OpenAI
     openai_api_key: str | None = Field(default=None, alias='OPENAI_API_KEY')

@@ -4,6 +4,7 @@ Handles file upload, text extraction (with OCR fallback), chunking, embedding, i
 Supports PDF (including encrypted/scanned), DOCX, PPTX, CSV, TXT, Markdown, and images.
 """
 import io
+import os
 import csv
 import zipfile
 import json
@@ -34,20 +35,56 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix='/ingest', tags=['ingest'])
 
+# ── Tesseract OCR engine wiring ─────────────────────────────────────────────
+try:
+    import pytesseract
+    _tesseract_path = os.environ.get('TESSERACT_CMD', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+    if os.path.exists(_tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_path
+        logger.info(f"Tesseract OCR engine found at: {_tesseract_path}")
+    else:
+        logger.warning(
+            f"Tesseract OCR engine not found at '{_tesseract_path}'. "
+            f"Image/scanned-PDF OCR will be skipped until it's installed "
+            f"(https://github.com/UB-Mannheim/tesseract/wiki) and TESSERACT_CMD is set in .env."
+        )
+except ImportError:
+    logger.warning("pytesseract not installed — OCR features disabled.")
+
 # ── Configuration ──────────────────────────────────────────────────────────
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
+MAX_FILE_SIZE_BYTES = 1000 * 1024 * 1024
+CHUNK_READ_SIZE = 1024 * 1024  # read the upload 1MB at a time instead of all at once
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'doc', 'pptx', 'ppt', 'csv', 'txt', 'md', 'png', 'jpg', 'jpeg', 'webp', 'gif'}
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
-# ── PDF Extraction (multi-strategy with OCR fallback) ─────────────────────
+MIN_PAGE_TEXT_CHARS = 20
+MAX_OCR_PAGES_PER_DOCUMENT = 15
+
+
+def _ocr_single_page(page, page_num: int) -> str:
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+
+        mat = fitz.Matrix(300 / 72, 300 / 72)
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_data))
+        text = pytesseract.image_to_string(img, lang='eng')
+        if text.strip():
+            logger.info(f"Per-page OCR: page {page_num} yielded {len(text)} chars")
+        return text
+    except Exception as e:
+        logger.warning(f"Per-page OCR failed on page {page_num}: {e}")
+        return ""
+
 
 def _extract_text_pdf_pymupdf(content: bytes) -> str | None:
-    """Primary: Extract text using PyMuPDF (fitz). Fastest, handles most PDFs including encrypted."""
     try:
-        import fitz  # PyMuPDF
+        import fitz
         doc = fitz.open(stream=content, filetype="pdf")
-        # Handle encrypted PDFs
         if doc.is_encrypted:
             for pw in ['', 'password', '1234', 'admin', 'user', '12345']:
                 try:
@@ -60,26 +97,39 @@ def _extract_text_pdf_pymupdf(content: bytes) -> str | None:
                 logger.warning("PyMuPDF: Could not decrypt PDF with common passwords")
                 doc.close()
                 return None
+
         pages = []
+        ocr_page_count = 0
         for page_num in range(len(doc)):
             try:
                 page = doc[page_num]
                 text = page.get_text("text")
-                if text and text.strip():
+                if text and len(text.strip()) >= MIN_PAGE_TEXT_CHARS:
                     pages.append(text)
+                    continue
+
+                blocks = page.get_text("blocks")
+                block_text = "\n".join(b[4] for b in blocks if b[6] == 0 and b[4].strip())
+                if block_text and len(block_text.strip()) >= MIN_PAGE_TEXT_CHARS:
+                    pages.append(block_text)
+                    continue
+
+                if ocr_page_count < MAX_OCR_PAGES_PER_DOCUMENT:
+                    ocr_page_count += 1
+                    ocr_text = _ocr_single_page(page, page_num)
+                    pages.append(ocr_text or text or block_text or '')
                 else:
-                    # Try extracting from images on the page (OCR-like)
-                    blocks = page.get_text("blocks")
-                    block_text = "\n".join(b[4] for b in blocks if b[6] == 0 and b[4].strip())
-                    if block_text.strip():
-                        pages.append(block_text)
+                    pages.append(text or block_text or '')
             except Exception as e:
                 logger.warning(f"PyMuPDF page {page_num} extraction failed: {e}")
                 pages.append('')
         doc.close()
         result = '\n\n'.join(pages)
         if result.strip():
-            logger.info(f"PyMuPDF: Extracted {len(result)} chars from {len(pages)} pages")
+            logger.info(
+                f"PyMuPDF: Extracted {len(result)} chars from {len(pages)} pages "
+                f"({ocr_page_count} page(s) needed per-page OCR)"
+            )
         return result
     except ImportError:
         logger.warning("PyMuPDF (fitz) not installed, falling back to pypdf")
@@ -90,7 +140,6 @@ def _extract_text_pdf_pymupdf(content: bytes) -> str | None:
 
 
 def _extract_text_pdf_pypdf(content: bytes) -> str | None:
-    """Fallback 1: Extract text using pypdf (supports AES encrypted PDFs via pycryptodome)."""
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(content))
@@ -122,7 +171,6 @@ def _extract_text_pdf_pypdf(content: bytes) -> str | None:
         logger.warning("pypdf not installed, falling back to PyPDF2")
         return None
     except Exception as e:
-        # Catch PyCryptodome errors gracefully
         error_msg = str(e).lower()
         if 'pycryptodome' in error_msg or 'aes' in error_msg or 'crypto' in error_msg:
             logger.warning(f"pypdf: Crypto dependency issue ({e}), will try other extractors")
@@ -132,7 +180,6 @@ def _extract_text_pdf_pypdf(content: bytes) -> str | None:
 
 
 def _extract_text_pdf_pypdf2(content: bytes) -> str | None:
-    """Fallback 2: extract text using PyPDF2."""
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(io.BytesIO(content))
@@ -156,20 +203,18 @@ def _extract_text_pdf_pypdf2(content: bytes) -> str | None:
 
 
 def _ocr_extract_text(content: bytes) -> str:
-    """OCR fallback for scanned/image-based PDFs."""
     try:
-        import fitz  # PyMuPDF - use it to convert PDF pages to images for OCR
+        import fitz
         import pytesseract
         from PIL import Image
 
         doc = fitz.open(stream=content, filetype="pdf")
         text_parts = []
-        max_pages = min(len(doc), 10)  # Limit OCR to first 10 pages for performance
+        max_pages = min(len(doc), 10)
 
         for page_num in range(max_pages):
             try:
                 page = doc[page_num]
-                # Render page to image at 300 DPI
                 mat = fitz.Matrix(300 / 72, 300 / 72)
                 pix = page.get_pixmap(matrix=mat)
                 img_data = pix.tobytes("png")
@@ -185,7 +230,6 @@ def _ocr_extract_text(content: bytes) -> str:
             logger.info(f"OCR: Extracted {len(result)} chars from {max_pages} pages")
         return result
     except ImportError:
-        # Fallback to pdf2image if PyMuPDF not available
         try:
             from pdf2image import convert_from_bytes
             import pytesseract
@@ -211,9 +255,6 @@ def _ocr_extract_text(content: bytes) -> str:
 
 
 def extract_text_pdf(content: bytes) -> str:
-    """Extract text from PDF with multi-strategy fallback pipeline.
-    Strategy: PyMuPDF → pypdf → PyPDF2 → OCR
-    Never returns raw error messages to the user."""
     strategies = [
         ("PyMuPDF", _extract_text_pdf_pymupdf),
         ("pypdf", _extract_text_pdf_pypdf),
@@ -233,23 +274,19 @@ def extract_text_pdf(content: bytes) -> str:
         except Exception as e:
             errors.append(f"{name}: {e}")
 
-    # Final fallback: OCR
-    logger.info("All text extractors returned empty, trying OCR...")
+    logger.info("All text extractors returned empty, trying whole-document OCR...")
     ocr_text = _ocr_extract_text(content)
     if ocr_text and ocr_text.strip():
-        logger.info("PDF extraction succeeded with OCR fallback")
+        logger.info("PDF extraction succeeded with whole-document OCR fallback")
         return ocr_text
 
-    # Log all errors for debugging but return friendly message
     for err in errors:
         logger.warning(f"PDF extraction attempt: {err}")
     logger.error("All PDF extraction strategies failed")
     return ""
 
 
-# ── DOCX / PPTX / CSV / Image Extraction ───────────────────────────────────
 def extract_text_docx(content: bytes) -> str:
-    """Extract text from DOCX using python-docx (preferred) or zipfile fallback."""
     try:
         from docx import Document
         doc = Document(io.BytesIO(content))
@@ -276,7 +313,6 @@ def extract_text_docx(content: bytes) -> str:
 
 
 def extract_text_pptx(content: bytes) -> str:
-    """Extract text from PPTX files."""
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as z:
             slide_texts = []
@@ -298,7 +334,6 @@ def extract_text_pptx(content: bytes) -> str:
 
 
 def extract_text_csv(content: bytes) -> str:
-    """Extract text from CSV with header-aware formatting."""
     try:
         text = content.decode('utf-8', errors='ignore')
         reader = csv.reader(io.StringIO(text))
@@ -320,7 +355,6 @@ def extract_text_csv(content: bytes) -> str:
 
 
 def extract_text_image(content: bytes) -> str:
-    """Extract text from images using OCR (Tesseract)."""
     try:
         from PIL import Image
         import pytesseract
@@ -335,7 +369,6 @@ def extract_text_image(content: bytes) -> str:
         return ""
 
 
-# ── Chunking Utility ───────────────────────────────────────────────────────
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     if not text or not text.strip():
         return []
@@ -353,7 +386,6 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 
-# ── Progress tracking ──────────────────────────────────────────────────────
 _indexing_progress: dict[str, dict] = {}
 
 
@@ -374,7 +406,6 @@ async def _index_document_background(
     doc_id: str, brand: str, filename: str, text: str,
     chunks: list[str], file_size: int, file_type: str
 ):
-    """Background indexing pipeline with progress tracking."""
     _update_progress(doc_id, status='indexing', stage='extracting', total_chunks=len(chunks))
     indexed_count = 0
     errors = []
@@ -424,7 +455,10 @@ async def _index_document_background(
 # ── Upload Endpoint ────────────────────────────────────────────────────────
 @router.post('/upload')
 async def upload_file(file: UploadFile = File(...), brand: str = Form(...)):
-    """Upload a file. Background indexing, returns immediately."""
+    """Upload a file. Reads the body in 1MB chunks (rather than one big
+    file.read()) so very large uploads don't blow past what the ASGI/
+    multipart layer can buffer in one go, and logs how long the read itself
+    took so slow transfers are visible in the terminal."""
     brand = (brand or '').strip()
     if not brand:
         raise HTTPException(status_code=400, detail="Brand is required")
@@ -434,15 +468,37 @@ async def upload_file(file: UploadFile = File(...), brand: str = Form(...)):
         raise HTTPException(status_code=400,
                             detail=f"Unsupported file type: .{ext}. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
     logger.info(f"Upload: filename='{filename}' brand='{brand}' ext='{ext}'")
-    content = await file.read()
+
+    read_start = _time.time()
+    chunks_buf = []
+    total_read = 0
+    try:
+        while True:
+            piece = await file.read(CHUNK_READ_SIZE)
+            if not piece:
+                break
+            total_read += len(piece)
+            if total_read > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large ({total_read/(1024*1024):.1f}MB). Max {MAX_FILE_SIZE_BYTES/(1024*1024):.0f}MB",
+                )
+            chunks_buf.append(piece)
+    except HTTPException:
+        raise
+    except Exception as read_err:
+        logger.error(f"Error reading upload body for '{filename}': {read_err}")
+        raise HTTPException(
+            status_code=400,
+            detail="The upload was interrupted or the request body could not be read. Try again — for very large files, a stable connection matters.",
+        )
+    content = b"".join(chunks_buf)
+    logger.info(f"Read {total_read/(1024*1024):.1f}MB for '{filename}' in {_time.time()-read_start:.2f}s")
+
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
-    if len(content) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413,
-                            detail=f"File too large ({len(content)/(1024*1024):.1f}MB). Max {MAX_FILE_SIZE_BYTES/(1024*1024):.0f}MB")
     file_size = len(content)
 
-    # Text Extraction
     extract_start = _time.time()
     text = ''
     try:
@@ -476,7 +532,6 @@ async def upload_file(file: UploadFile = File(...), brand: str = Form(...)):
         else:
             raise HTTPException(status_code=400, detail="Document appears empty or contains no extractable text.")
 
-    # Chunking
     chunks = chunk_text(text)
     logger.info(f"Chunking: {len(chunks)} chunks")
     if not chunks:
@@ -558,7 +613,6 @@ def get_file_metadata(file_id: str):
 
 @router.get('/files/{file_id}/preview')
 def preview_uploaded_file(file_id: str):
-    """Preview document content with full metadata."""
     doc = get_document(file_id)
     if not doc:
         raise HTTPException(status_code=404, detail='Document not found')
@@ -569,12 +623,10 @@ def preview_uploaded_file(file_id: str):
     uploaded_at = doc.get('uploaded_at', '')
     file_size = doc.get('size', 0)
 
-    # For images, return as base64 embedded HTML
     if file_type == 'image' and content and content.startswith('['):
-        # Just show the metadata for image files
         pass
 
-    preview_content = content[:50000] if content else ''  # Limit preview to 50KB
+    preview_content = content[:50000] if content else ''
 
     return PlainTextResponse(
         preview_content,
@@ -592,7 +644,6 @@ def preview_uploaded_file(file_id: str):
 
 @router.get('/files/{file_id}/preview/html')
 def preview_uploaded_file_html(file_id: str):
-    """Preview document content as HTML with formatting."""
     from fastapi.responses import HTMLResponse
     doc = get_document(file_id)
     if not doc:
@@ -604,13 +655,10 @@ def preview_uploaded_file_html(file_id: str):
     uploaded_at = doc.get('uploaded_at', '')
     file_size = doc.get('size', 0)
 
-    # Truncate for preview
     preview_text = content[:50000] if content else ''
 
-    # Escape HTML
     import html
     escaped = html.escape(preview_text)
-    # Simple markdown-like rendering for line breaks
     html_content = escaped.replace('\n', '<br>')
 
     html_response = f"""<!DOCTYPE html>
@@ -667,4 +715,3 @@ def reset_uploads():
     _indexing_progress.clear()
     reset_uploaded_documents()
     return {'status': 'reset', 'summary': get_upload_summary()}
-

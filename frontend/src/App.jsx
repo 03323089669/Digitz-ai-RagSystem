@@ -149,9 +149,11 @@ function App() {
   const [brandModalData, setBrandModalData] = useState(null)
 
   const selectedBrand =
-    brands.find((b) => b.key === activeBrand) ??
-    brands[0] ??
-    { key: '', name: 'No company selected', color: '#7b6ef6', docs: 0, files: 0, queries: 0, content: 0 }
+    activeBrand === 'ALL'
+      ? { key: 'ALL', name: 'All Available Brands', color: '#7b6ef6', docs: 0, files: 0, queries: 0, content: 0 }
+      : brands.find((b) => b.key === activeBrand) ??
+        brands[0] ??
+        { key: '', name: 'No company selected', color: '#7b6ef6', docs: 0, files: 0, queries: 0, content: 0 }
 
   const syncTheme = useCallback((nextTheme) => {
     const root = document.documentElement
@@ -190,6 +192,12 @@ function App() {
   }, [])
 
   const handleBrandChange = useCallback(async (brandKey) => {
+    // Allow "ALL" as a special search scope (not a real brand)
+    if (brandKey === 'ALL') {
+      setActiveBrand('ALL')
+      return
+    }
+    // For regular brands, check validity
     if (!brandKey || brandKey === activeBrand) return
     setActiveBrand(brandKey)
     try {
@@ -234,6 +242,8 @@ function App() {
 
   useEffect(() => {
     if (!brands.length) return
+    // "ALL" is a valid special value that doesn't need to exist in brands list
+    if (activeBrand === 'ALL') return
     const exists = brands.some((b) => b.key === activeBrand)
     if (!exists) setActiveBrand(brands[0]?.key ?? '')
   }, [brands, activeBrand])

@@ -182,10 +182,9 @@ export default function Settings() {
               <div className="form-group">
                 <label className="form-label">Active LLM Model</label>
                 <select className="select-box w-full" value={settings.ai_model} onChange={(e) => set('ai_model', e.target.value)}>
-                  <option value="llama3-8b-8192">Llama 3 8B (Groq)</option>
-                  <option value="llama3-70b-8192">Llama 3 70B (Groq)</option>
-                  <option value="mixtral-8x7b-32768">Mixtral 8x7B (Groq)</option>
-                  <option value="gpt-4o">GPT-4o (OpenAI)</option>
+                  <option value="openai/gpt-oss-20b">GPT OSS 20B (Groq Fast)</option>
+                  <option value="openai/gpt-oss-120b">GPT OSS 120B (Groq Quality)</option>
+                  <option value="llama-3.3-70b-versatile">Llama 3.3 70B (Groq)</option>
                   <option value="gpt-4o-mini">GPT-4o Mini (OpenAI)</option>
                 </select>
               </div>

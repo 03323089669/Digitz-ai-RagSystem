@@ -121,7 +121,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         api_key_setting='groq_key',
         env_key='GROQ_API_KEY',
         chat_url=os.environ.get('GROQ_API_URL', 'https://api.groq.com/openai/v1/chat/completions'),
-        chat_model=os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+        chat_model=os.environ.get('GROQ_MODEL', 'openai/gpt-oss-20b'),
         supports_vision=False,
         headers_fn=_openai_headers,
         payload_fn=_openai_payload,
@@ -254,10 +254,13 @@ def _call_chat_api(
         )
 
     url = provider_cfg.chat_url
-    model = provider_cfg.chat_model
-
-    # Build payload using provider-specific function
-    payload = provider_cfg.payload_fn(prompt, system_instructions, model)
+    candidate_models = []
+    seen = set()
+    fallback_pool = [provider_cfg.chat_model, 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'] if provider_cfg.name.lower() == 'groq' else [provider_cfg.chat_model]
+    for model_name in fallback_pool:
+        if model_name and model_name not in seen:
+            seen.add(model_name)
+            candidate_models.append(model_name)
 
     # Build headers
     headers = provider_cfg.headers_fn(api_key) if provider_cfg.headers_fn else {
@@ -265,32 +268,38 @@ def _call_chat_api(
         "Content-Type": "application/json",
     }
 
-    # NOTE: Gemini auth now goes through the X-goog-api-key header (see
-    # _gemini_headers above), not a "?key=" query string — the query-string
-    # method is rejected (403/404/401) for accounts issued the newer "AQ."
-    # format keys. Do NOT append ?key= to the URL here.
+    last_error = None
+    for model in candidate_models:
+        payload = provider_cfg.payload_fn(prompt, system_instructions, model)
+        try:
+            logger.info(f"Calling {provider_cfg.name} API: model={model} url={url[:60]}...")
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                data = response.json()
+                text = _extract_text_response(provider_cfg.name.lower(), data)
+                if text:
+                    return text
+                logger.error(f"{provider_cfg.name} returned empty response: {json.dumps(data)[:200]}")
+                return "Sorry, I couldn't generate a response right now. Please try again."
 
-    try:
-        logger.info(f"Calling {provider_cfg.name} API: model={model} url={url[:60]}...")
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if response.status_code == 200:
-            data = response.json()
-            text = _extract_text_response(provider_cfg.name.lower(), data)
-            if text:
-                return text
-            logger.error(f"{provider_cfg.name} returned empty response: {json.dumps(data)[:200]}")
-            return f"{provider_cfg.name} returned an empty response. Please try again."
-        logger.error(f"{provider_cfg.name} API error: {response.status_code} - {response.text[:200]}")
-        return f"{provider_cfg.name} returned an error ({response.status_code}). Please try again or check your API key."
-    except requests.exceptions.Timeout:
-        logger.error(f"{provider_cfg.name} request timed out after {timeout}s")
-        return f"{provider_cfg.name} request timed out. Please try again."
-    except requests.exceptions.ConnectionError:
-        logger.error(f"{provider_cfg.name} connection error")
-        return f"Could not connect to {provider_cfg.name} API. Please check your network and try again."
-    except Exception as e:
-        logger.error(f"{provider_cfg.name} error: {e}")
-        return f"Could not connect to {provider_cfg.name} API. Please check your network and try again."
+            body_text = response.text[:200]
+            last_error = f"{provider_cfg.name} API error ({response.status_code}): {body_text}"
+            logger.warning(f"{provider_cfg.name} model '{model}' failed: {response.status_code} - {body_text}")
+
+            if response.status_code in (400, 404) and any(kw in body_text.lower() for kw in ['model', 'does not exist', 'decommissioned', 'not exist']):
+                continue
+            return "Sorry, I couldn't generate a response right now. Please try again."
+        except requests.exceptions.Timeout:
+            logger.error(f"{provider_cfg.name} request timed out after {timeout}s")
+            return f"{provider_cfg.name} request timed out. Please try again."
+        except requests.exceptions.ConnectionError:
+            logger.error(f"{provider_cfg.name} connection error")
+            return f"Could not connect to {provider_cfg.name} API. Please check your network and try again."
+        except Exception as e:
+            logger.error(f"{provider_cfg.name} error: {e}")
+            return f"Could not connect to {provider_cfg.name} API. Please check your network and try again."
+
+    return "Sorry, I couldn't generate a response right now. Please try again."
 
 
 # ── Local embedding ────────────────────────────────────────────────────────────

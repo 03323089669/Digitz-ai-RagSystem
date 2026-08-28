@@ -101,17 +101,104 @@ def mmr_rerank(chunks: List[dict], query_embedding: List[float], top_k: int = 4,
 # Retrieval Pipeline
 # =============================================================
 
+def retrieve_chunks_all_brands(query: str, top_k: int = 5) -> List[dict]:
+    """Cross-brand retrieval: search across all available brands and combine results.
+
+    Returns a merged list of top chunks with brand metadata preserved.
+    """
+    from core.db import get_brands, get_brand_chunks_keyword
+    from core.llm_router import generate_embedding
+
+    start = _time.time()
+    logger.info(f"Cross-brand retrieval for query='{query[:60]}...' top_k={top_k}")
+
+    all_brands = get_brands()
+    if not all_brands:
+        logger.warning("No brands found in system")
+        return []
+
+    all_results = []
+
+    # For each brand, retrieve chunks
+    for brand in all_brands:
+        brand_key = brand.get('key')
+        if not brand_key:
+            continue
+
+        try:
+            # Try ChromaDB first (faster)
+            try:
+                chroma_hits = chroma_store.query(brand_key, query, top_k=top_k)
+                if chroma_hits:
+                    for hit in chroma_hits:
+                        cleaned = clean_chunk_text(hit.get('document', ''))
+                        if cleaned:
+                            all_results.append({
+                                'chunk_text': cleaned,
+                                'doc_title': hit.get('metadata', {}).get('document_title', 'document'),
+                                'brand_key': hit.get('metadata', {}).get('brand', brand_key),
+                                'score': hit.get('similarity', 0.0),
+                            })
+            except Exception as e:
+                logger.debug(f"ChromaDB search for brand '{brand_key}' failed: {e}")
+
+            # Keyword search fallback
+            try:
+                kw_hits = get_brand_chunks_keyword(brand_key, query, top_k=3)
+                for item in kw_hits:
+                    cleaned = clean_chunk_text(item.get('chunk_text', ''))
+                    if cleaned:
+                        all_results.append({
+                            'chunk_text': cleaned,
+                            'doc_title': item.get('doc_title', 'document'),
+                            'brand_key': item.get('brand_key', brand_key),
+                            'score': item.get('score', 0.5),
+                        })
+            except Exception as e:
+                logger.debug(f"Keyword search for brand '{brand_key}' failed: {e}")
+
+        except Exception as e:
+            logger.warning(f"Error retrieving chunks for brand '{brand_key}': {e}")
+            continue
+
+    if not all_results:
+        logger.info(f"No results found across any brand")
+        return []
+
+    # Deduplication & Scoring Sort
+    seen_texts = set()
+    unique_results = []
+    for r in all_results:
+        key = r['chunk_text'][:150].strip().lower()
+        if key not in seen_texts:
+            seen_texts.add(key)
+            unique_results.append(r)
+
+    # Sort by score (descending) and return top k
+    unique_results.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+    final_results = unique_results[:top_k]
+
+    logger.info(f"Cross-brand retrieval complete in {_time.time() - start:.3f}s: returned {len(final_results)} chunks from {len(all_brands)} brands")
+    return final_results
+
+
 def retrieve_chunks(query: str, brand_key: str, top_k: int = 5) -> List[dict]:
     """Optimized High-Speed Hybrid Retrieval pipeline:
-    1. Check Chroma cache
-    2. Try ChromaDB Vector Search (primary fast index)
-    3. Fast SQL Keyword match for high precision
-    4. Fallback to SQLite Vector Search only if ChromaDB returns empty
+    1. Check if brand_key is "ALL" for cross-brand search
+    2. Check Chroma cache
+    3. Try ChromaDB Vector Search (primary fast index)
+    4. Fast SQL Keyword match for high precision
+    5. Fallback to SQLite Vector Search only if ChromaDB returned empty
     """
     start = _time.time()
     logger.info(f"Retrieving chunks for brand='{brand_key}' query='{query[:60]}...' top_k={top_k}")
 
-    # Stage 0: Cache Lookup
+    # Handle cross-brand retrieval
+    is_all_brands = brand_key and str(brand_key).strip().upper() in ("ALL", "ALL BRANDS", "ALL_BRANDS", "ALLBRANDS")
+    if is_all_brands:
+        return retrieve_chunks_all_brands(query, top_k=top_k)
+
+    # Stage 0: Cache Lookup (single brand)
     cache_hits = get_chroma_cache(brand_key, query, top_k)
     if cache_hits:
         logger.info(f"Cache HIT ({len(cache_hits)} results)")
@@ -216,18 +303,44 @@ MODE_INSTRUCTIONS = {
 
 
 def _build_prompt(query: str, chunks: List[dict], brand_key: str, mode: str | None = None) -> str:
-    brand = get_brand(brand_key)
-    brand_name = brand['name'] if brand else brand_key
-    custom_prompt = brand.get('ai_prompt') if brand else ""
-
-    system_instructions = (
-        f"You are Digitz AI, an intelligent brand intelligence assistant for {brand_name}.\n"
-        f"Rules:\n"
-        f"1. Provide a direct, high-quality, professional response strictly using the Knowledge Base context below.\n"
-        f"2. Use clean, executive GitHub-flavored Markdown formatting.\n"
-        f"3. Do NOT output empty or 'Not applicable' placeholder sections.\n"
-        f"4. If the exact answer is not in the context, synthesize what relevant information is available in the brand documents.\n"
-    )
+    is_all_brands = brand_key and str(brand_key).strip().upper() in ("ALL", "ALL BRANDS", "ALL_BRANDS", "ALLBRANDS")
+    if is_all_brands:
+        brand_name = "All Available Brands"
+        custom_prompt = ""
+        # For cross-brand queries, add context about multiple brands
+        brands_in_results = set()
+        for chunk in chunks:
+            brands_in_results.add(chunk.get('brand_key', 'Unknown'))
+        brands_str = ", ".join(sorted(brands_in_results))
+        system_instructions = (
+            f"You are Digitz AI, an intelligent brand intelligence assistant with access to multiple brands.\n"
+            f"Brands in knowledge base: {brands_str}\n"
+            f"Rules:\n"
+            f"1. Provide a direct, high-quality, professional response using the available context from multiple brands.\n"
+            f"2. Use clean, executive GitHub-flavored Markdown formatting.\n"
+            f"3. Always clearly mention which brand information comes from (e.g., '[KIA]', '[ENGRO]').\n"
+            f"4. When comparing brands, highlight the differences clearly.\n"
+            f"5. Do NOT output empty or 'Not applicable' placeholder sections.\n"
+            f"6. If the exact answer is not in the context, synthesize what relevant information is available in the brand documents.\n"
+        )
+    else:
+        # ── FIX: brand_name and custom_prompt were previously undefined in
+        # this branch, causing a NameError (crash) on every single-brand
+        # query — e.g. "which type of Data in this engro" with ENGRO
+        # selected always failed with "Sorry, I couldn't generate a
+        # response." This is why cross-brand (ALL) queries worked but
+        # single-brand queries did not.
+        brand = get_brand(brand_key)
+        brand_name = brand.get('name', brand_key) if brand else brand_key
+        custom_prompt = (brand.get('custom_prompt') or '') if brand else ''
+        system_instructions = (
+            f"You are Digitz AI, an executive brand assistant for {brand_name}.\n"
+            f"Rules:\n"
+            f"1. Give the direct answer first.\n"
+            f"2. Use clear Markdown headings, bullet points, and concise structure.\n"
+            f"3. Be extremely fast and brief. Avoid fluff or repetitive disclaimers.\n"
+            f"4. Use available context only. If data is unavailable, respond: 'No relevant data found.'\n"
+        )
 
     if custom_prompt:
         system_instructions += f"\nBrand Voice Guidelines: {custom_prompt}\n"
@@ -236,7 +349,9 @@ def _build_prompt(query: str, chunks: List[dict], brand_key: str, mode: str | No
 
     context_blocks = []
     for chunk in chunks[:5]:
-        context_blocks.append(f"--- [Document: {chunk['doc_title']}] ---\n{chunk['chunk_text']}")
+        # Add brand label to each context block for cross-brand clarity
+        brand_label = f" [{chunk['brand_key'].upper()}]" if brand_key == "ALL" else ""
+        context_blocks.append(f"--- [Document: {chunk['doc_title']}{brand_label}] ---\n{chunk['chunk_text']}")
 
     context_str = "\n\n".join(context_blocks) if context_blocks else "No specific document context found."
 

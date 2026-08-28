@@ -20,7 +20,7 @@ async def stream_llm_response(
     system_instructions: str = "",
     chunk_size: int = 5,
 ) -> AsyncGenerator[str, None]:
-    """Stream tokens from the active provider using SSE.
+    """Stream tokens from the active provider using SSE in a single-pass request.
 
     Yields JSON-encoded token events: {"token": "Hello", "done": false}
     Final event: {"token": "", "done": true}
@@ -38,59 +38,90 @@ async def stream_llm_response(
         return
 
     url = cfg.chat_url
-    model = cfg.chat_model
     headers = cfg.headers_fn(api_key) if cfg.headers_fn else _openai_headers(api_key)
 
-    # Build streaming payload
-    if provider == 'gemini':
-        combined = f"{system_instructions}\n\n{prompt}" if system_instructions else prompt
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": combined}]}],
-            "generationConfig": {"temperature": 0.2},
-        }
-        stream_url = f"{url}?alt=sse&key={api_key}"
-    elif provider == 'claude':
-        payload = {
-            "model": model,
-            "max_tokens": 1024,
-            "stream": True,
-            "system": system_instructions or "You are a helpful assistant.",
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        stream_url = url
-    else:
-        # OpenAI-compatible (Groq, OpenAI, DeepSeek)
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_instructions or "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-            "stream": True,
-        }
-        stream_url = url
+    model_candidates = []
+    seen = set()
+    fallback_pool = [cfg.chat_model, 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'] if provider == 'groq' else [cfg.chat_model]
+    for model_name in fallback_pool:
+        if model_name and model_name not in seen:
+            seen.add(model_name)
+            model_candidates.append(model_name)
 
-    try:
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(
-            None,
-            lambda: requests.post(stream_url, headers=headers, json=payload, stream=True, timeout=120),
-        )
+    connected_resp = None
+    loop = asyncio.get_event_loop()
 
-        if resp.status_code != 200:
-            error_text = resp.text[:200]
-            logger.error(f"Streaming {cfg.name} error: {resp.status_code} - {error_text}")
-            yield json.dumps({"error": f"{cfg.name} returned error ({resp.status_code}): {error_text}"})
+    for model in model_candidates:
+        if provider == 'gemini':
+            combined = f"{system_instructions}\n\n{prompt}" if system_instructions else prompt
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": combined}]}],
+                "generationConfig": {"temperature": 0.2},
+            }
+            stream_url = f"{url}?alt=sse&key={api_key}"
+        elif provider == 'claude':
+            payload = {
+                "model": model,
+                "max_tokens": 1024,
+                "stream": True,
+                "system": system_instructions or "You are a helpful assistant.",
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            stream_url = url
+        else:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_instructions or "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "stream": True,
+            }
+            stream_url = url
+
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                lambda: requests.post(stream_url, headers=headers, json=payload, stream=True, timeout=120),
+            )
+
+            if resp.status_code == 200:
+                connected_resp = resp
+                break
+
+            body_text = resp.text[:200]
+            logger.warning(f"Streaming model '{model}' failed for {cfg.name}: {resp.status_code} - {body_text}")
+            if resp.status_code in (400, 404) and any(kw in body_text.lower() for kw in ['model', 'does not exist', 'decommissioned', 'not exist']):
+                continue
+
+            yield json.dumps({"error": "Sorry, I couldn't generate a response right now. Please try again."})
+            return
+        except requests.exceptions.Timeout:
+            yield json.dumps({"error": "Request timed out. Please try again."})
+            return
+        except Exception as e:
+            logger.error(f"Streaming connection error: {e}")
+            yield json.dumps({"error": "Could not connect to AI service. Please check your network and try again."})
             return
 
+    if not connected_resp:
+        yield json.dumps({"error": "Sorry, I couldn't generate a response right now. Please try again."})
+        return
+
+    # Direct single-pass stream processing
+    # Force UTF-8 decoding — without this, `requests` falls back to
+    # ISO-8859-1 for `application/json` responses (no charset in the
+    # Content-Type header), which mangles multi-byte characters like
+    # curly quotes/apostrophes (') into "â€™".
+    connected_resp.encoding = 'utf-8'
+    try:
         buffer = ""
-        for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
+        for chunk in connected_resp.iter_content(chunk_size=None, decode_unicode=True):
             if not chunk:
                 continue
 
             if provider == 'gemini':
-                # Gemini SSE format: data: {...}
                 for line in chunk.split('\n'):
                     line = line.strip()
                     if line.startswith('data: '):
@@ -107,7 +138,6 @@ async def stream_llm_response(
                         except json.JSONDecodeError:
                             pass
             elif provider == 'claude':
-                # Claude SSE format: event: content_block_delta / message_stop
                 buffer += chunk
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
@@ -123,7 +153,7 @@ async def stream_llm_response(
                         except json.JSONDecodeError:
                             pass
             else:
-                # OpenAI-compatible SSE format: data: {"choices":[{"delta":{"content":"Hello"}}]}
+                # OpenAI-compatible (Groq, OpenAI, DeepSeek)
                 buffer += chunk
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
@@ -139,18 +169,13 @@ async def stream_llm_response(
                                 token = delta.get('content', '')
                                 if token:
                                     yield json.dumps({"token": token, "done": False})
-                                finish_reason = choices[0].get('finish_reason')
-                                if finish_reason:
-                                    if finish_reason == 'stop':
-                                        pass  # will send done below
                         except json.JSONDecodeError:
                             pass
 
         yield json.dumps({"token": "", "done": True})
 
     except requests.exceptions.Timeout:
-        yield json.dumps({"error": "Request timed out. Please try again."})
+        yield json.dumps({"error": "Request timed out during streaming. Please try again."})
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        yield json.dumps({"error": f"Streaming failed: {str(e)[:100]}"})
-
+        logger.error(f"Streaming token loop error: {e}")
+        yield json.dumps({"error": "Streaming encountered an error. Please try again."})

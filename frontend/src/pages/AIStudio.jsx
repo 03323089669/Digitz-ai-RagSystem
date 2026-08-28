@@ -23,7 +23,7 @@ import {
 // about being a global switch, not a per-turn one.
 // ─────────────────────────────────────────────────────────────────────────
 const MODEL_OPTIONS = [
-  { value: 'groq', label: 'Llama 3 (Groq)', icon: 'ti-bolt' },
+  { value: 'groq', label: 'GPT OSS 20B (Groq)', icon: 'ti-bolt' },
   { value: 'openai', label: 'GPT-4o mini (OpenAI)', icon: 'ti-brand-openai' },
   { value: 'claude', label: 'Claude (Anthropic)', icon: 'ti-sparkles' },
   { value: 'gemini', label: 'Gemini (Google)', icon: 'ti-brand-google' },
@@ -251,7 +251,7 @@ export default function AIStudio({ selectedBrand, onBrandChange, brands = [], on
   const imageInputRef = useRef(null)
   const recognitionRef = useRef(null)
 
-  const brandLabel = selectedBrand?.name || 'Brand'
+  const brandLabel = selectedBrand?.key === 'ALL' ? 'ALL BRANDS' : (selectedBrand?.name || 'Brand')
   const isAdmin = user?.role === 'admin'
 
   // ── Load current global provider so the selector reflects reality ──────
@@ -324,27 +324,6 @@ export default function AIStudio({ selectedBrand, onBrandChange, brands = [], on
   }, [prompt])
 
   const broadcastChatUpdated = () => window.dispatchEvent(new Event('digitz:chat-updated'))
-
-  // ── Streaming-style reveal: backend returns the full answer at once, so
-  // we progressively render it word-by-word for a live "typing" feel. ─────
-  const streamInMessage = useCallback((messageId, fullText) => {
-    const words = fullText.split(' ')
-    let i = 0
-    const step = Math.max(1, Math.round(words.length / 60))
-    const interval = setInterval(() => {
-      i += step
-      const partial = words.slice(0, i).join(' ')
-      setMessages((prev) => prev.map((m) => (
-        m.id === messageId ? { ...m, streamedContent: partial } : m
-      )))
-      if (i >= words.length) {
-        clearInterval(interval)
-        setMessages((prev) => prev.map((m) => (
-          m.id === messageId ? { ...m, streamedContent: undefined } : m
-        )))
-      }
-    }, 18)
-  }, [])
 
 
 
@@ -483,60 +462,76 @@ export default function AIStudio({ selectedBrand, onBrandChange, brands = [], on
         const decoder = new TextDecoder()
         let accumulatedText = ""
         let sources = []
+        let eventBuffer = ""
 
         while (true) {
           const { done, value } = await reader.read()
-          if (done || signal.aborted) break
-          
-          const chunkStr = decoder.decode(value)
-          // Lines in Server Sent Events are separated by double newline
-          const lines = chunkStr.split('\n\n')
-          
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.substring(6))
-                if (data.type === 'token') {
-                  accumulatedText += data.token
-                  setMessages((prev) => prev.map((m) => 
-                    m.id === pendingId ? { ...m, content: accumulatedText, pending: false } : m
-                  ))
-                } else if (data.type === 'sources') {
-                  sources = data.sources
-                  setMessages((prev) => prev.map((m) => 
-                    m.id === pendingId ? { ...m, sources } : m
-                  ))
-                } else if (data.type === 'done') {
-                  accumulatedText = data.content
-                  if (data.session_id && data.session_id !== sessionId) {
-                    setSessionId(data.session_id)
-                    navigate(`/chat/${data.session_id}`, { replace: true })
-                  }
-                  setMessages((prev) => prev.map((m) => 
-                    m.id === pendingId ? { 
-                      ...m, 
-                      content: accumulatedText, 
-                      pending: false,
-                      sources,
-                      responseTime: data.response_time,
-                      timestamp: new Date().toISOString()
-                    } : m
-                  ))
-                } else if (data.type === 'error') {
-                  throw new Error(data.error)
-                }
-              } catch (e) {
-                // Ignore parse errors from partial chunks
+          if (signal.aborted) break
+          eventBuffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+          const events = eventBuffer.split(/\r?\n\r?\n/)
+          eventBuffer = events.pop() || ''
+
+          for (const event of events) {
+            const dataLine = event.split(/\r?\n/).find((line) => line.startsWith('data:'))
+            if (!dataLine) continue
+            const payload = dataLine.slice(5).trim()
+            if (payload === '[DONE]') continue
+
+            let data
+            try {
+              data = JSON.parse(payload)
+            } catch (parseError) {
+              console.error('Invalid SSE payload from AI backend:', payload, parseError)
+              throw new Error('The AI backend returned an invalid response.')
+            }
+
+            if (data.type === 'token') {
+              accumulatedText += data.token || ''
+              setMessages((prev) => prev.map((m) =>
+                m.id === pendingId ? { ...m, content: accumulatedText, pending: false } : m
+              ))
+            } else if (data.type === 'sources') {
+              sources = Array.isArray(data.sources) ? data.sources : []
+              setMessages((prev) => prev.map((m) =>
+                m.id === pendingId ? { ...m, sources } : m
+              ))
+            } else if (data.type === 'done') {
+              const finalContent = data.content ?? data.answer ?? data.response ?? accumulatedText
+              if (!String(finalContent || '').trim()) {
+                throw new Error('The AI backend returned an empty response.')
               }
+              accumulatedText = String(finalContent)
+              if (data.session_id && data.session_id !== sessionId) {
+                setSessionId(data.session_id)
+                navigate(`/chat/${data.session_id}`, { replace: true })
+              }
+              setMessages((prev) => prev.map((m) =>
+                m.id === pendingId ? {
+                  ...m,
+                  content: accumulatedText,
+                  pending: false,
+                  sources,
+                  responseTime: data.response_time,
+                  timestamp: new Date().toISOString()
+                } : m
+              ))
+            } else if (data.type === 'error') {
+              throw new Error(data.error || 'The AI provider failed to generate a response.')
             }
           }
+
+          if (done) break
+        }
+
+        if (!accumulatedText.trim()) {
+          throw new Error('The AI backend returned an empty response.')
         }
         broadcastChatUpdated()
       }
     } catch (error) {
       if (error?.name === 'AbortError' || signal.aborted) return
       console.error('AI query failed:', error)
-      const errorMessage = error?.message || 'Unable to reach the Digitz AI backend.'
+      const errorMessage = 'Sorry, I couldn\'t generate a response. Please try again.'
       setMessages((prev) => prev.map((m) =>
         m.id === pendingId ? { id: pendingId, role: 'assistant', content: errorMessage, isError: true, timestamp: new Date().toISOString() } : m
       ))
@@ -769,6 +764,7 @@ export default function AIStudio({ selectedBrand, onBrandChange, brands = [], on
               else { onBrandChange(e.target.value); navigate('/studio') }
             }}
           >
+            <option value="ALL">ALL BRANDS</option>
             {brands.map((b) => <option key={b.key} value={b.key}>{b.name}</option>)}
             <option value="other">+ Add New Brand</option>
           </select>

@@ -848,7 +848,10 @@ def get_brand_chunks_topk(brand_key: str, query_embedding: list[float], top_k: i
 
 
 def get_brand_chunks_keyword(brand_key: str, query_text: str, top_k: int = 20) -> list[dict]:
-    """Retrieve top chunks for a brand by SQL LIKE keyword match on chunk_text."""
+    """Retrieve top chunks for a brand by SQL LIKE keyword match on chunk_text.
+    
+    If brand_key is "ALL", searches across all brands. Otherwise, searches specific brand.
+    """
     import time as _time
     start = _time.time()
     
@@ -865,17 +868,30 @@ def get_brand_chunks_keyword(brand_key: str, query_text: str, top_k: int = 20) -
         
     if not conditions:
         return []
-        
-    sql = f"""
-        SELECT v.*, d.title as doc_title, d.brand_key
-        FROM vectors v
-        JOIN documents d ON v.document_id = d.id
-        WHERE d.brand_key = ? AND ({" OR ".join(conditions)})
-        LIMIT {top_k}
-    """
+    
+    # Handle cross-brand queries
+    if brand_key == "ALL":
+        # Query across all brands
+        sql = f"""
+            SELECT v.*, d.title as doc_title, d.brand_key
+            FROM vectors v
+            JOIN documents d ON v.document_id = d.id
+            WHERE ({" OR ".join(conditions)})
+            LIMIT {top_k}
+        """
+    else:
+        # Query specific brand
+        sql = f"""
+            SELECT v.*, d.title as doc_title, d.brand_key
+            FROM vectors v
+            JOIN documents d ON v.document_id = d.id
+            WHERE d.brand_key = ? AND ({" OR ".join(conditions)})
+            LIMIT {top_k}
+        """
+        params = [brand_key] + params
     
     with get_conn() as conn:
-        rows = conn.execute(sql, (brand_key, *params)).fetchall()
+        rows = conn.execute(sql, params).fetchall()
         results = []
         for r in rows:
             dict_row = _row_to_dict(r)

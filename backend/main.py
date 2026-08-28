@@ -58,7 +58,7 @@ app = FastAPI(
 # ==========================================================
 
 # Allow localhost dev + any additional ports (Vite may use different port).
-# If you deploy, replace with explicit origins.
+# If you deploy, replace with explicit production origins.
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -68,16 +68,14 @@ origins = [
     "http://127.0.0.1:3000",
 ]
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
 
 # ==========================================================
 # Startup
@@ -122,6 +120,13 @@ async def root():
     }
 
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok"
+    }
+
+
 @app.get("/status")
 async def status():
     return {
@@ -142,3 +147,8 @@ async def debug_users():
 async def debug_cache():
     """View cache performance stats."""
     return get_cache_stats()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

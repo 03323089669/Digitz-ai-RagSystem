@@ -84,7 +84,6 @@ class StatusResponse(BaseModel):
 @router.post("/", response_model=QueryResponse, summary="Execute RAG query")
 def run_query(request: QueryRequest, current_user: dict = Depends(get_current_user)):
     """Execute a standard Retrieval-Augmented Generation (RAG) query.
-
     Retrieves brand knowledge context, constructs optimized prompts,
     executes LLM inference, and logs session messages.
     """
@@ -321,6 +320,10 @@ async def stream_query(
                         return
 
                     if data.get("done"):
+                        if not accumulated.strip():
+                            logger.error("Streaming provider completed without response content")
+                            yield f"data: {json.dumps({'type': 'error', 'error': 'The AI provider returned an empty response.'})}\n\n"
+                            return
                         elapsed = round(time.time() - start_time, 3)
                         save_chat_message(
                             session["id"],
